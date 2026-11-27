@@ -2,7 +2,7 @@
 
 A RESTful backend API built with **Node.js, Express.js, and MongoDB**. This project provides structured API endpoints for managing application data with secure authentication, database integration, and efficient server-side operations.
 
-🌐 **Live Server:** https://assingment-8-backend-qejgfz7zd.vercel.app
+🌐 **Live Server:** https://studiospace-backend-phi.vercel.app/
 
 ---
 
