@@ -6,860 +6,547 @@ import { MongoClient, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
-const PORT = process.env.PORT || process.env.SERVER_PORT || 5000;
+const PORT = process.env.PORT || 5000;
 
-// ========================================
-// Environment Variables
-// ========================================
+const client = new MongoClient(process.env.MONGODB_URI);
 
-const MONGODB_URI = process.env.MONGODB_URI;
-const CLIENT_URL = process.env.CLIENT_URL;
+if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is missing");
+if (!process.env.CLIENT_URL) throw new Error("CLIENT_URL is missing");
+if (!process.env.BETTER_AUTH_URL) throw new Error("BETTER_AUTH_URL is missing");
 
-if (!MONGODB_URI) {
-  throw new Error("MONGODB_URI is missing from environment variables");
-}
+const CLIENT_URL = process.env.CLIENT_URL.split(",").map(url => url.trim());
+const ADMIN_EMAIL = process.env.STUDIO_ADMIN_EMAIL?.trim().toLowerCase();
 
-if (!CLIENT_URL) {
-  throw new Error("CLIENT_URL is missing from environment variables");
-}
-
-// ========================================
-// Middleware
-// ========================================
-
-const allowedOrigins = CLIENT_URL.split(",")
-  .map((url) => url.trim())
-  .filter(Boolean);
-
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      return callback(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || CLIENT_URL.includes(origin)) return callback(null, true);
+    callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true
+}));
 
 app.use(express.json());
-
-// ========================================
-// Better Auth JWT Configuration
-// ========================================
-
-const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL;
-const STUDIO_ADMIN_EMAIL = process.env.STUDIO_ADMIN_EMAIL
-  ?.trim()
-  .toLowerCase();
-
-if (!BETTER_AUTH_URL) {
-  throw new Error("BETTER_AUTH_URL is missing from environment variables");
-}
-
-const JWKS = createRemoteJWKSet(
-  new URL("/api/auth/jwks", BETTER_AUTH_URL)
-);
 
 // ========================================
 // MongoDB Connection
 // ========================================
 
-const client = new MongoClient(MONGODB_URI);
-
-async function connectToMongoDB() {
+export async function connectToMongoDB() {
   try {
     await client.connect();
-    console.log("You successfully connected to MongoDB!");
+    console.log("Connected to MongoDB!");
     return client;
   } catch (error) {
-    console.error("MongoDB connection failed:", error);
+    console.error(error);
     throw error;
   }
 }
 
 const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("StudioSpace");
-const studioCollection = db.collection("studios");
-const legacyStudioCollection = db.collection("Assingment");
-const [studioCount, legacyStudioCount] = await Promise.all([
-  studioCollection.estimatedDocumentCount(),
-  legacyStudioCollection.estimatedDocumentCount(),
-]);
 
-if (studioCount === 0 && legacyStudioCount > 0) {
-  await legacyStudioCollection
-    .aggregate([
-      {
-        $merge: {
-          into: "studios",
-          on: "_id",
-          whenMatched: "keepExisting",
-          whenNotMatched: "insert",
-        },
-      },
-    ])
-    .toArray();
+const studioCollection = db.collection("studios");
+const legacyCollection = db.collection("Assingment");
+const bookingCollection = db.collection("bookings");
+
+// Migrate old studios
+if (
+  await studioCollection.estimatedDocumentCount() === 0 &&
+  await legacyCollection.estimatedDocumentCount() > 0
+) {
+  await legacyCollection.aggregate([
+    {
+      $merge: {
+        into: "studios",
+        on: "_id",
+        whenMatched: "keepExisting",
+        whenNotMatched: "insert"
+      }
+    }
+  ]).toArray();
 }
 
-const bookingCollection = db.collection("bookings");
 await bookingCollection.createIndex({ customerId: 1, createdAt: -1 });
 await bookingCollection.createIndex({ studioId: 1, startsAt: 1, status: 1 });
 
 // ========================================
-// Authentication Middleware
+// Authentication
 // ========================================
+
+const JWKS = createRemoteJWKSet(
+  new URL("/api/auth/jwks", process.env.BETTER_AUTH_URL)
+);
 
 const verifyToken = async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization;
-
-    let token = authHeader?.startsWith("Bearer ")
-      ? authHeader.split(" ")[1]
+    let token = req.headers.authorization?.startsWith("Bearer ")
+      ? req.headers.authorization.split(" ")[1]
       : null;
 
-    // Fallback to Better Auth session cookie
     if (!token && req.headers.cookie) {
-      const cookies = {};
-      const cookieList = req.headers.cookie.split(";");
+      const cookies = Object.fromEntries(
+        req.headers.cookie.split(";").map(cookie => {
+          const [key, ...value] = cookie.trim().split("=");
+          return [key, decodeURIComponent(value.join("="))];
+        })
+      );
 
-      for (const cookie of cookieList) {
-        const [name, ...value] = cookie.trim().split("=");
-        cookies[name] = decodeURIComponent(value.join("="));
-      }
-
-      token =
-        cookies["better-auth.session_token"] ||
-        cookies["better-auth.session_token.0"];
+      token = cookies["better-auth.session_token"] ||
+              cookies["better-auth.session_token.0"];
     }
 
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: "Unauthorized. Please login first.",
-      });
-    }
+    if (!token) return res.status(401).send({ message: "Please login first" });
 
     const { payload } = await jwtVerify(token, JWKS);
 
+    console.log(payload)
     if (!payload.sub) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid authentication token",
-      });
+      return res.status(401).send({ message: "Invalid token" });
     }
 
     req.user = {
       sub: payload.sub,
       email: payload.email || null,
-      name: payload.name || null,
+      name: payload.name || null
     };
 
     next();
   } catch (error) {
     console.error("Authentication error:", error.message);
-
-    return res.status(401).json({
-      success: false,
-      message: "Invalid or expired token",
-    });
+    console.log(error)
+    res.status(401).send({ message: "Invalid or expired token" });
   }
 };
 
 // ========================================
-// Studio Data Normalizer
+// Helpers
 // ========================================
 
-function normalizeStudio(data) {
-  return {
-    ...data,
-    title: typeof data.title === "string" ? data.title.trim() : "",
-    slug: typeof data.slug === "string" ? data.slug.trim() : "",
-    description:
-      typeof data.description === "string" ? data.description.trim() : "",
-    category: typeof data.category === "string" ? data.category : "",
-    categoryName:
-      typeof data.categoryName === "string" ? data.categoryName : "",
-    image: typeof data.image === "string" ? data.image.trim() : "",
-    gallery: Array.isArray(data.gallery)
-      ? data.gallery.filter((image) => typeof image === "string")
-      : [],
-    hourlyRate: Number(data.hourlyRate),
-    securityDeposit: Number(data.securityDeposit || 0),
-    rating: Number(data.rating || 0),
-    totalReviews: Number(data.totalReviews || 0),
-    location:
-      typeof data.location === "object" &&
-      data.location !== null &&
-      !Array.isArray(data.location)
-        ? data.location
-        : {},
-    capacity: Number(data.capacity ?? data.maxCapacity ?? 0),
-    isAvailable: data.isAvailable ?? true,
-    isFeatured: data.isFeatured ?? false,
-    amenities: Array.isArray(data.amenities) ? data.amenities : [],
-    host: data.host || {},
-    reviews: Array.isArray(data.reviews) ? data.reviews : [],
-  };
-}
+const asyncHandler = fn => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
-function isStudioAdmin(user) {
-  return Boolean(
-    STUDIO_ADMIN_EMAIL &&
-      user.email?.trim().toLowerCase() === STUDIO_ADMIN_EMAIL,
-  );
-}
+const validId = id => ObjectId.isValid(id);
+
+const ownerFilter = user => ({
+  ...(ADMIN_EMAIL && user.email?.toLowerCase() === ADMIN_EMAIL
+    ? {}
+    : { ownerId: user.sub })
+});
+
+const normalizeStudio = data => ({
+  ...data,
+  title: typeof data.title === "string" ? data.title.trim() : "",
+  slug: typeof data.slug === "string" ? data.slug.trim() : "",
+  description: typeof data.description === "string" ? data.description.trim() : "",
+  category: typeof data.category === "string" ? data.category : "",
+  categoryName: typeof data.categoryName === "string" ? data.categoryName : "",
+  image: typeof data.image === "string" ? data.image.trim() : "",
+  gallery: Array.isArray(data.gallery) ? data.gallery : [],
+  hourlyRate: Number(data.hourlyRate),
+  securityDeposit: Number(data.securityDeposit || 0),
+  rating: Number(data.rating || 0),
+  totalReviews: Number(data.totalReviews || 0),
+  location: data.location && typeof data.location === "object" &&
+    !Array.isArray(data.location) ? data.location : {},
+  capacity: Number(data.capacity ?? data.maxCapacity ?? 0),
+  isAvailable: data.isAvailable ?? true,
+  isFeatured: data.isFeatured ?? false,
+  amenities: Array.isArray(data.amenities) ? data.amenities : [],
+  host: data.host || {},
+  reviews: Array.isArray(data.reviews) ? data.reviews : []
+});
+
+const validStudio = data =>
+  data.title && data.slug && data.description &&
+  data.category && data.image &&
+  Number.isFinite(data.hourlyRate) && data.hourlyRate > 0 &&
+  Number.isFinite(data.securityDeposit) && data.securityDeposit >= 0 &&
+  Number.isInteger(data.capacity) && data.capacity >= 1 &&
+  typeof data.location.city === "string" &&
+  typeof data.location.area === "string" &&
+  typeof data.location.country === "string" &&
+  Array.isArray(data.gallery) &&
+  data.gallery.every(item => typeof item === "string") &&
+  Array.isArray(data.amenities) &&
+  data.amenities.every(item => typeof item === "string");
 
 // ========================================
-// Root Route
+// Home
 // ========================================
 
 app.get("/", (req, res) => {
-  res.send("StudioSpace API is running successfully");
+  res.send({ message: "StudioSpace API is running!" });
 });
 
 // ========================================
 // GET ALL STUDIOS
 // ========================================
 
-app.get("/Studios", async (req, res) => {
-  try {
-    const { category } = req.query;
+app.get("/Studios", asyncHandler(async (req, res) => {
+  const query = {};
 
-    const query = {};
+  if (req.query.category) query.category = req.query.category;
+  if (req.query.available === "true") query.isAvailable = { $ne: false };
 
-    if (category) {
-      query.category = category;
-    }
-    if (req.query.available === "true") {
-      query.isAvailable = { $ne: false };
-    }
+  const sort = req.query.sort === "rating"
+    ? { rating: -1, createdAt: -1 }
+    : { createdAt: -1 };
 
-    const sort =
-      req.query.sort === "rating"
-        ? { rating: -1, createdAt: -1 }
-        : { createdAt: -1 };
-    const cursor = studioCollection.find(query).sort(sort);
-    const requestedLimit = Number(req.query.limit);
-    const studios = await (Number.isInteger(requestedLimit) && requestedLimit > 0
-      ? cursor.limit(Math.min(requestedLimit, 100))
-      : cursor)
-      .toArray();
+  let cursor = studioCollection.find(query).sort(sort);
 
-    res.status(200).json({
-      success: true,
-      count: studios.length,
-      data: studios,
-    });
-  } catch (error) {
-    console.error("Get studios error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch studios",
-    });
+  const limit = Number(req.query.limit);
+  if (Number.isInteger(limit) && limit > 0) {
+    cursor = cursor.limit(Math.min(limit, 100));
   }
-});
+
+  const data = await cursor.toArray();
+  res.send({ success: true, count: data.length, data });
+}));
 
 // ========================================
-// GET FEATURED STUDIOS
+// FEATURED STUDIOS
 // ========================================
 
-app.get("/featured-studios", async (req, res) => {
-  try {
-    const studios = await studioCollection
-      .find({ isFeatured: true })
-      .sort({ rating: -1, createdAt: -1 })
-      .limit(6)
-      .toArray();
+app.get("/featured-studios", asyncHandler(async (req, res) => {
+  const data = await studioCollection
+    .find({ isFeatured: true })
+    .sort({ rating: -1, createdAt: -1 })
+    .limit(6)
+    .toArray();
 
-    res.status(200).json({
-      success: true,
-      count: studios.length,
-      data: studios,
-    });
-  } catch (error) {
-    console.error("Featured studios error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch featured studios",
-    });
-  }
-});
+  res.send({ success: true, count: data.length, data });
+}));
 
 // ========================================
 // GET SINGLE STUDIO
 // ========================================
 
-app.get("/Studio/:id", verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid studio ID",
-      });
-    }
-
-    const studio = await studioCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    if (!studio) {
-      return res.status(404).json({
-        success: false,
-        message: "Studio not found",
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: studio,
-    });
-  } catch (error) {
-    console.error("Get single studio error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch studio",
-    });
+app.get("/Studio/:id", verifyToken, asyncHandler(async (req, res) => {
+  if (!validId(req.params.id)) {
+    return res.status(400).send({ message: "Invalid studio ID" });
   }
-});
+
+  const data = await studioCollection.findOne({
+    _id: new ObjectId(req.params.id)
+  });
+
+  if (!data) return res.status(404).send({ message: "Studio not found" });
+
+  res.send({ success: true, data });
+}));
 
 // ========================================
 // CREATE STUDIO
 // ========================================
 
-app.post("/Studios", verifyToken, async (req, res) => {
-  try {
-    if (
-      typeof req.body !== "object" ||
-      req.body === null ||
-      Array.isArray(req.body)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide studio details in a JSON object.",
-      });
-    }
-    if (
-      (req.body.gallery !== undefined &&
-        (!Array.isArray(req.body.gallery) ||
-          !req.body.gallery.every((image) => typeof image === "string"))) ||
-      (req.body.amenities !== undefined &&
-        (!Array.isArray(req.body.amenities) ||
-          !req.body.amenities.every(
-            (amenity) => typeof amenity === "string",
-          )))
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Gallery and amenities must be arrays of text values.",
-      });
-    }
+app.post("/Studios", verifyToken, asyncHandler(async (req, res) => {
+  const data = normalizeStudio(req.body);
 
-    const studioData = normalizeStudio(req.body);
-
-    if (
-      !studioData.title ||
-      !studioData.slug ||
-      !studioData.description ||
-      !studioData.category ||
-      !studioData.image ||
-      !Number.isFinite(studioData.hourlyRate) ||
-      studioData.hourlyRate <= 0 ||
-      !Number.isFinite(studioData.securityDeposit) ||
-      studioData.securityDeposit < 0 ||
-      !Number.isInteger(studioData.capacity) ||
-      studioData.capacity < 1 ||
-      typeof studioData.location.city !== "string" ||
-      typeof studioData.location.area !== "string" ||
-      typeof studioData.location.country !== "string" ||
+  if (!validStudio(data) ||
       (req.body.isAvailable !== undefined &&
-        typeof req.body.isAvailable !== "boolean")
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide valid studio details, pricing, and guest capacity.",
-      });
-    }
-
-    const existingStudio = await studioCollection.findOne({
-      slug: studioData.slug,
-    });
-
-    if (existingStudio) {
-      return res.status(409).json({
-        success: false,
-        message: "A studio with this slug already exists",
-      });
-    }
-
-    const newStudio = {
-      ...studioData,
-      ownerId: req.user.sub,
-      ownerEmail: req.user.email,
-      rating: 0,
-      totalReviews: 0,
-      isFeatured: false,
-      reviews: [],
-      host: {
-        name: req.user.name || req.user.email || "Studio Host",
-        email: req.user.email,
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await studioCollection.insertOne(newStudio);
-
-    res.status(201).json({
-      success: true,
-      message: "Studio created successfully",
-      data: {
-        ...newStudio,
-        _id: result.insertedId,
-      },
-    });
-  } catch (error) {
-    console.error("Create studio error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to create studio",
-    });
+       typeof req.body.isAvailable !== "boolean")) {
+    return res.status(400).send({ message: "Invalid studio information" });
   }
-});
+
+  if (await studioCollection.findOne({ slug: data.slug })) {
+    return res.status(409).send({ message: "Studio slug already exists" });
+  }
+
+  const newStudio = {
+    ...data,
+    ownerId: req.user.sub,
+    ownerEmail: req.user.email,
+    rating: 0,
+    totalReviews: 0,
+    isFeatured: false,
+    reviews: [],
+    host: {
+      name: req.user.name || req.user.email || "Studio Host",
+      email: req.user.email
+    },
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+
+  const result = await studioCollection.insertOne(newStudio);
+
+  res.status(201).send({
+    success: true,
+    message: "Studio created successfully",
+    data: { ...newStudio, _id: result.insertedId }
+  });
+}));
 
 // ========================================
 // UPDATE STUDIO
 // ========================================
 
-app.patch("/Studio/:id", verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
+app.patch("/Studio/:id", verifyToken, asyncHandler(async (req, res) => {
+  const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid studio ID",
-      });
-    }
+  if (!validId(id)) {
+    return res.status(400).send({ message: "Invalid studio ID" });
+  }
 
-    if (
-      typeof req.body !== "object" ||
-      req.body === null ||
-      Array.isArray(req.body)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide studio changes in a JSON object.",
-      });
-    }
+  const fields = [
+    "title", "slug", "description", "category", "categoryName",
+    "image", "gallery", "hourlyRate", "securityDeposit",
+    "location", "capacity", "isAvailable", "amenities"
+  ];
 
-    const normalizedData = normalizeStudio(req.body);
-    const editableFields = [
-      "title",
-      "slug",
-      "description",
-      "category",
-      "categoryName",
-      "image",
-      "gallery",
-      "hourlyRate",
-      "securityDeposit",
-      "location",
-      "capacity",
-      "isAvailable",
-      "amenities",
-    ];
-    const updateData = Object.fromEntries(
-      editableFields
-        .filter((field) => Object.hasOwn(req.body, field))
-        .map((field) => [field, normalizedData[field]]),
-    );
+  const data = normalizeStudio(req.body);
+  const updateData = Object.fromEntries(
+    fields.filter(key => Object.hasOwn(req.body, key))
+      .map(key => [key, data[key]])
+  );
 
-    if (
-      ["title", "slug", "description", "category", "image"].some(
-        (field) =>
-          field in updateData &&
-          (typeof updateData[field] !== "string" || !updateData[field]),
-      ) ||
-      ("gallery" in updateData &&
-        (!Array.isArray(req.body.gallery) ||
-          !req.body.gallery.every((image) => typeof image === "string"))) ||
-      ("amenities" in updateData &&
-        (!Array.isArray(req.body.amenities) ||
-          !req.body.amenities.every(
-            (amenity) => typeof amenity === "string",
-          ))) ||
-      ("location" in updateData &&
-        (typeof updateData.location !== "object" ||
-          updateData.location === null ||
-          Array.isArray(updateData.location) ||
-          typeof updateData.location.city !== "string" ||
-          typeof updateData.location.area !== "string" ||
-          typeof updateData.location.country !== "string")) ||
-      ("isAvailable" in updateData &&
-        typeof updateData.isAvailable !== "boolean")
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide valid text, gallery, and amenity values.",
-      });
-    }
+  if (!Object.keys(updateData).length) {
+    return res.status(400).send({ message: "No changes provided" });
+  }
 
-    if (
-      ("hourlyRate" in updateData &&
-        (!Number.isFinite(updateData.hourlyRate) ||
-          updateData.hourlyRate <= 0)) ||
-      ("securityDeposit" in updateData &&
-        (!Number.isFinite(updateData.securityDeposit) ||
-          updateData.securityDeposit < 0)) ||
-      ("capacity" in updateData &&
-        (!Number.isInteger(updateData.capacity) || updateData.capacity < 1))
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide valid pricing, security deposit, and guest capacity.",
-      });
-    }
+  if (
+    ["title", "slug", "description", "category", "image"].some(
+      key => key in updateData &&
+        (typeof updateData[key] !== "string" || !updateData[key])
+    ) ||
+    ("gallery" in updateData &&
+      (!Array.isArray(req.body.gallery) ||
+       !req.body.gallery.every(item => typeof item === "string"))) ||
+    ("amenities" in updateData &&
+      (!Array.isArray(req.body.amenities) ||
+       !req.body.amenities.every(item => typeof item === "string"))) ||
+    ("location" in updateData &&
+      (!data.location ||
+       typeof data.location.city !== "string" ||
+       typeof data.location.area !== "string" ||
+       typeof data.location.country !== "string")) ||
+    ("isAvailable" in updateData &&
+      typeof updateData.isAvailable !== "boolean") ||
+    ("hourlyRate" in updateData &&
+      (!Number.isFinite(data.hourlyRate) || data.hourlyRate <= 0)) ||
+    ("securityDeposit" in updateData &&
+      (!Number.isFinite(data.securityDeposit) || data.securityDeposit < 0)) ||
+    ("capacity" in updateData &&
+      (!Number.isInteger(data.capacity) || data.capacity < 1))
+  ) {
+    return res.status(400).send({ message: "Invalid studio information" });
+  }
 
-    if (Object.keys(updateData).length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide at least one editable studio field.",
-      });
-    }
-
-    const result = await studioCollection.updateOne(
-      {
-        _id: new ObjectId(id),
-        ...(isStudioAdmin(req.user) ? {} : { ownerId: req.user.sub }),
-      },
-      {
-        $set: {
-          ...updateData,
-          updatedAt: new Date(),
-        },
-      },
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Studio not found or you are not the owner",
-      });
-    }
-
-    const updatedStudio = await studioCollection.findOne({
-      _id: new ObjectId(id),
+  if (updateData.slug) {
+    const duplicate = await studioCollection.findOne({
+      slug: updateData.slug,
+      _id: { $ne: new ObjectId(id) }
     });
 
-    res.status(200).json({
-      success: true,
-      message: "Studio updated successfully",
-      data: updatedStudio,
-    });
-  } catch (error) {
-    console.error("Update studio error:", error);
+    if (duplicate) {
+      return res.status(409).send({ message: "Studio slug already exists" });
+    }
+  }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to update studio",
+  const result = await studioCollection.updateOne(
+    { _id: new ObjectId(id), ...ownerFilter(req.user) },
+    { $set: { ...updateData, updatedAt: new Date() } }
+  );
+
+  if (!result.matchedCount) {
+    return res.status(404).send({
+      message: "Studio not found or you are not the owner"
     });
   }
-});
+
+  const updated = await studioCollection.findOne({
+    _id: new ObjectId(id)
+  });
+
+  res.send({ success: true, message: "Studio updated", data: updated });
+}));
 
 // ========================================
 // DELETE STUDIO
 // ========================================
 
-app.delete("/Studio/:id", verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
+app.delete("/Studio/:id", verifyToken, asyncHandler(async (req, res) => {
+  if (!validId(req.params.id)) {
+    return res.status(400).send({ message: "Invalid studio ID" });
+  }
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid studio ID",
-      });
-    }
+  const result = await studioCollection.deleteOne({
+    _id: new ObjectId(req.params.id),
+    ...ownerFilter(req.user)
+  });
 
-    const result = await studioCollection.deleteOne({
-      _id: new ObjectId(id),
-      ...(isStudioAdmin(req.user) ? {} : { ownerId: req.user.sub }),
-    });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Studio not found or you are not the owner",
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: "Studio deleted successfully",
-    });
-  } catch (error) {
-    console.error("Delete studio error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to delete studio",
+  if (!result.deletedCount) {
+    return res.status(404).send({
+      message: "Studio not found or you are not the owner"
     });
   }
-});
+
+  res.send({ success: true, message: "Studio deleted successfully" });
+}));
 
 // ========================================
-// GET MY STUDIOS
+// MY STUDIOS
 // ========================================
 
-app.get("/my-studios", verifyToken, async (req, res) => {
-  try {
-    const studios = await studioCollection
-      .find({
-        ownerId: req.user.sub,
-      })
-      .sort({ createdAt: -1 })
-      .toArray();
+app.get("/my-studios", verifyToken, asyncHandler(async (req, res) => {
+  const data = await studioCollection.find({
+    ownerId: req.user.sub
+  }).sort({ createdAt: -1 }).toArray();
 
-    res.status(200).json({
-      success: true,
-      count: studios.length,
-      data: studios,
-    });
-  } catch (error) {
-    console.error("My studios error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch your studios",
-    });
-  }
-});
+  res.send({ success: true, count: data.length, data });
+}));
 
 // ========================================
 // CREATE BOOKING
 // ========================================
 
-app.post("/Bookings", verifyToken, async (req, res) => {
-  try {
-    if (
-      typeof req.body !== "object" ||
-      req.body === null ||
-      Array.isArray(req.body)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide booking details in a JSON object.",
-      });
+app.post("/Bookings", verifyToken, asyncHandler(async (req, res) => {
+  const { studioId, startsAt, durationHours } = req.body;
+  const duration = Number(durationHours);
+
+  if (
+    typeof studioId !== "string" || !validId(studioId) ||
+    typeof startsAt !== "string" ||
+    !Number.isInteger(duration) || duration < 1 || duration > 24
+  ) {
+    return res.status(400).send({ message: "Invalid booking information" });
+  }
+
+  const start = new Date(startsAt);
+
+  if (!Number.isFinite(start.getTime()) || start <= new Date()) {
+    return res.status(400).send({ message: "Choose a future booking time" });
+  }
+
+  const studio = await studioCollection.findOne({
+    _id: new ObjectId(studioId)
+  });
+
+  if (!studio || studio.isAvailable === false) {
+    return res.status(404).send({ message: "Studio is unavailable" });
+  }
+
+  const end = new Date(start.getTime() + duration * 3600000);
+
+  const bookings = await bookingCollection.find({
+    studioId,
+    status: { $ne: "Cancelled" },
+    startsAt: {
+      $gte: new Date(start.getTime() - 86400000),
+      $lt: end
     }
+  }).toArray();
 
-    const { studioId, startsAt, durationHours } = req.body;
-    const duration = Number(durationHours);
+  const overlap = bookings.some(booking => {
+    const existingStart = new Date(booking.startsAt).getTime();
+    const existingEnd = existingStart +
+      Number(booking.durationHours) * 3600000;
 
-    if (
-      typeof studioId !== "string" ||
-      !ObjectId.isValid(studioId) ||
-      typeof startsAt !== "string" ||
-      !Number.isInteger(duration) ||
-      duration < 1 ||
-      duration > 24
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Provide a valid studio, start time, and duration from 1 to 24 hours.",
-      });
-    }
+    return start.getTime() < existingEnd &&
+           end.getTime() > existingStart;
+  });
 
-    const start = new Date(startsAt);
-    if (!Number.isFinite(start.getTime()) || start <= new Date()) {
-      return res.status(400).json({
-        success: false,
-        message: "Choose a valid future booking time.",
-      });
-    }
-
-    const studio = await studioCollection.findOne({
-      _id: new ObjectId(studioId),
+  if (overlap) {
+    return res.status(409).send({
+      message: "Studio already has a booking at this time"
     });
+  }
 
-    if (!studio || studio.isAvailable === false) {
-      return res.status(404).json({
-        success: false,
-        message: "This studio is not available for booking.",
-      });
-    }
+  const booking = {
+    studioId,
+    title: studio.title,
+    image: studio.image,
+    category: studio.categoryName || studio.category,
+    hourlyRate: Number(studio.hourlyRate),
+    securityDeposit: Number(studio.securityDeposit || 0),
+    city: studio.location?.city || "",
+    area: studio.location?.area || "",
+    startsAt: start,
+    durationHours: duration,
+    totalPrice: Number(studio.hourlyRate) * duration,
+    customerId: req.user.sub,
+    customerEmail: req.user.email,
+    status: "Pending",
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
 
-    const end = new Date(start.getTime() + duration * 60 * 60 * 1000);
-    const earliestOverlappingStart = new Date(
-      start.getTime() - 24 * 60 * 60 * 1000,
-    );
-    const existingBookings = await bookingCollection
-      .find({
-        studioId,
-        status: { $ne: "Cancelled" },
-        startsAt: { $gte: earliestOverlappingStart, $lt: end },
-      })
-      .project({ startsAt: 1, durationHours: 1 })
-      .toArray();
-    const hasOverlap = existingBookings.some((booking) => {
-      const existingStart = new Date(booking.startsAt).getTime();
-      const existingEnd =
-        existingStart + Number(booking.durationHours) * 60 * 60 * 1000;
-      return start.getTime() < existingEnd && end.getTime() > existingStart;
-    });
+  const result = await bookingCollection.insertOne(booking);
 
-    if (hasOverlap) {
-      return res.status(409).json({
-        success: false,
-        message: "This studio already has a booking request for that time.",
-      });
-    }
+  res.status(201).send({
+    success: true,
+    message: "Booking created successfully",
+    data: { ...booking, _id: result.insertedId }
+  });
+}));
 
-    const booking = {
-      studioId,
-      title: studio.title,
-      image: studio.image,
-      category: studio.categoryName || studio.category,
-      hourlyRate: Number(studio.hourlyRate),
-      securityDeposit: Number(studio.securityDeposit || 0),
-      city: studio.location?.city || "",
-      area: studio.location?.area || "",
-      startsAt: start,
-      durationHours: duration,
-      totalPrice: Number(studio.hourlyRate) * duration,
+// ========================================
+// MY BOOKINGS
+// ========================================
+
+app.get("/my-bookings", verifyToken, asyncHandler(async (req, res) => {
+  const data = await bookingCollection.find({
+    customerId: req.user.sub
+  }).sort({ createdAt: -1 }).toArray();
+
+  res.send({ success: true, count: data.length, data });
+}));
+
+// ========================================
+// CANCEL BOOKING
+// ========================================
+
+app.patch("/Bookings/:id/cancel", verifyToken, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (!validId(id)) {
+    return res.status(400).send({ message: "Invalid booking ID" });
+  }
+
+  const result = await bookingCollection.updateOne(
+    {
+      _id: new ObjectId(id),
       customerId: req.user.sub,
-      customerEmail: req.user.email,
-      status: "Pending",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
+      status: "Pending"
+    },
+    { $set: { status: "Cancelled", updatedAt: new Date() } }
+  );
 
-    const result = await bookingCollection.insertOne(booking);
-    res.status(201).json({
-      success: true,
-      message: "Booking request created successfully",
-      data: { ...booking, _id: result.insertedId },
+  if (!result.matchedCount) {
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(id),
+      customerId: req.user.sub
     });
-  } catch (error) {
-    console.error("Create booking error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to create booking request",
+
+    return res.status(booking ? 409 : 404).send({
+      message: booking
+        ? "Only pending bookings can be cancelled"
+        : "Booking not found"
     });
   }
-});
+
+  res.send({ success: true, message: "Booking cancelled successfully" });
+}));
 
 // ========================================
-// GET CURRENT USER BOOKINGS
-// ========================================
-
-app.get("/my-bookings", verifyToken, async (req, res) => {
-  try {
-    const bookings = await bookingCollection
-      .find({ customerId: req.user.sub })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.status(200).json({
-      success: true,
-      count: bookings.length,
-      data: bookings,
-    });
-  } catch (error) {
-    console.error("Get bookings error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch your bookings",
-    });
-  }
-});
-
-// ========================================
-// CANCEL CURRENT USER PENDING BOOKING
-// ========================================
-
-app.patch("/Bookings/:id/cancel", verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid booking ID",
-      });
-    }
-
-    const result = await bookingCollection.updateOne(
-      {
-        _id: new ObjectId(id),
-        customerId: req.user.sub,
-        status: "Pending",
-      },
-      { $set: { status: "Cancelled", updatedAt: new Date() } },
-    );
-
-    if (result.matchedCount === 0) {
-      const booking = await bookingCollection.findOne({
-        _id: new ObjectId(id),
-        customerId: req.user.sub,
-      });
-      return res.status(booking ? 409 : 404).json({
-        success: false,
-        message: booking
-          ? "Only pending bookings can be cancelled."
-          : "Booking not found.",
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: "Booking cancelled successfully",
-    });
-  } catch (error) {
-    console.error("Cancel booking error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to cancel booking",
-    });
-  }
-});
-
-// ========================================
-// 404 Route
+// 404 & ERROR HANDLING
 // ========================================
 
 app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: "API endpoint not found",
-  });
+  res.status(404).send({ message: "API endpoint not found" });
 });
-
-// ========================================
-// Global Error Handler
-// ========================================
 
 app.use((error, req, res, next) => {
-  console.error("Server error:", error);
-
-  res.status(500).json({
-    success: false,
-    message: "Internal server error",
-  });
+  console.error(error);
+  res.status(500).send({ message: "Internal server error" });
 });
 
 // ========================================
-// Start Server
+// START SERVER
 // ========================================
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`StudioSpace server running on port ${PORT}`);
 });
-export default app
+
+export default app;
